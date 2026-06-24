@@ -1,5 +1,7 @@
+using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.UIElements;
 
 public class PlayerMovement : MonoBehaviour
 {
@@ -10,19 +12,22 @@ public class PlayerMovement : MonoBehaviour
     private Rigidbody2D rb;
 
     //移动参数
-    private Vector2 moveVelocity;
+    public float horizontalVelocity { get; private set; }
     private bool isFacingRight;
 
     //碰撞检测参数
     private RaycastHit2D groundHit;
     private RaycastHit2D headHit;
+    private RaycastHit2D wallHit;
+    private RaycastHit2D lastWallHit;
     private bool isGrounded;
     private bool bumpedHead;
+    private bool isTouchingWall;
 
     //跳跃参数
     public float VerticalVelocity { get; private set; } // 当前竖直方向速度（向上为正，向下为负，外部仅可读，内部修改）
     private bool isJumping;                // 是否处于起跳上升阶段
-    private bool isFastFalliing;           // 是否处于快速下落状态（松开跳跃键加速下坠）
+    private bool isFastFalling;           // 是否处于快速下落状态（松开跳跃键加速下坠）
     private bool isFalling;                // 是否整体处于下落阶段（过顶点后）
     private float fastFallTime;            // 快速下坠生效的计时
     private float fastFallReleaseSpeed;    // 松开跳跃键瞬间记录的竖直速度，用于计算短跳加速
@@ -39,6 +44,36 @@ public class PlayerMovement : MonoBehaviour
 
     private float coyoteTimer;             // 土狼时间剩余计时（离开平台后仍可起跳的窗口期）
 
+    // 滑墙相关状态变量
+    private bool isWallSliding;              // 是否处于贴墙下滑状态
+    private bool isWallSlideFalling;         // 滑墙阶段是否进入下坠阶段
+
+    // 墙跳相关状态变量
+    private bool useWallJumpMoveStats;       // 是否启用墙跳专属移动参数
+    private bool isWallJumping;              // 是否正在执行墙跳上升阶段
+    private float wallJumpTime;              // 墙跳持续上升计时
+    private bool isWallJumpFastFalling;      // 墙跳后是否开启快速下坠
+    private bool isWallJumpFalling;          // 墙跳完成后是否进入下落阶段
+    private float wallJumpFastFallTime;      // 墙跳快速下坠生效时长
+    private float wallJumpFastFallReleaseSpeed; // 松开跳跃键瞬间记录的墙跳竖直速度
+
+    private float wallJumpPostBufferTimer;   // 墙跳缓冲后置计时器
+
+    private float wallJumpApexPoint;         // 墙跳最高点竖直坐标
+    private float timePastWallJumpApexThreshold; // 越过墙跳顶点阈值后的累计计时
+    private bool isPastWallJumpApexThreshold; // 是否已经越过墙跳最高点阈值（进入顶点滞空区间）
+
+    // 冲刺相关状态变量
+    private bool isDashing;                  // 是否正在冲刺
+    private bool isAirDashing;                // 是否为空中冲刺
+    private float dashTimer;                 // 单次冲刺剩余持续计时
+    private float dashOnGroundTimer;         // 地面连续冲刺冷却计时
+    private int numberOfDashesUsed;          // 已使用的冲刺次数（限制连续冲刺上限）
+    private Vector2 dashDirection;           // 当前冲刺的移动方向向量
+    private bool isDashFastFalling;          // 冲刺结束后是否开启快速下坠
+    private float dashFastFallTime;          // 冲刺快速下坠生效时长
+    private float dashFastFallReleaseSpeed;  // 松开冲刺/跳跃时记录的冲刺竖直速度
+
     void Awake()
     {
         isFacingRight = true;
@@ -49,6 +84,9 @@ public class PlayerMovement : MonoBehaviour
     {
         CountTimers();
         JumpChecks();
+        LandCheck();
+        WallSlideCheck();
+        WallJumpCheck();
     }
 
     void FixedUpdate()
@@ -57,14 +95,45 @@ public class PlayerMovement : MonoBehaviour
         
         Jump();
 
+        Fall();
+
+        WallSlide();
+        
+        WallJump();
+
         if(isGrounded)
         {
             Move(moveStats.GroundAcceleration, moveStats.GroundDeceleration, InputManager.Movement);
         }
         else
         {
-            Move(moveStats.AirAcceleration, moveStats.AirDeceleration, InputManager.Movement);
+            if(useWallJumpMoveStats)
+            {
+                Move(moveStats.WallJumpMoveAcceleration, moveStats.WallJumpMoveDeceleration, InputManager.Movement);
+            }
+            else
+            {
+                Move(moveStats.AirAcceleration, moveStats.AirDeceleration, InputManager.Movement);
+            }
         }
+
+        ApplyVelocity();
+    }
+
+    private void ApplyVelocity()
+    {
+        //限制最大下落速度
+        if(!isDashing)
+        {
+            VerticalVelocity = Mathf.Clamp(VerticalVelocity, -moveStats.MaxFallSpeed, 50f);
+        }    
+        else
+        {
+            VerticalVelocity = Mathf.Clamp(VerticalVelocity, -50f, 50f);
+        }
+
+
+        rb.linearVelocity = new Vector2(horizontalVelocity, VerticalVelocity);
     }
 
     #region 移动
@@ -76,30 +145,30 @@ public class PlayerMovement : MonoBehaviour
     /// <param name="moveInput">移动向量</param>
     private void Move(float acceleration, float deceleration, Vector2 moveInput)
     {
-        if(moveInput != Vector2.zero)
+        if(!isDashing)
         {
-            //检查角色是否需要转向
-            TurnCheck(moveInput);
-
-            Vector2 targetVelocity = Vector2.zero;
-            if(InputManager.RunIsHeld)
+            if(Mathf.Abs(moveInput.x) >= moveStats.MoveThreshold)
             {
-                targetVelocity = new Vector2(moveInput.x, 0f) * moveStats.MaxRunSpeed;
+                //检查角色是否需要转向
+                TurnCheck(moveInput);
+
+                float targetVelocity = 0f;
+                if(InputManager.RunIsHeld)
+                {
+                    targetVelocity = moveInput.x * moveStats.MaxRunSpeed;
+                }
+                else
+                {
+                    targetVelocity = moveInput.x * moveStats.MaxWalkSpeed;
+                }
+
+                horizontalVelocity = Mathf.Lerp(horizontalVelocity, targetVelocity, acceleration * Time.fixedDeltaTime);
             }
-            else
+
+            else if (Mathf.Abs(moveInput.x) < moveStats.MoveThreshold)
             {
-                targetVelocity = new Vector2(moveInput.x, 0f) * moveStats.MaxWalkSpeed;
+                horizontalVelocity = Mathf.Lerp(horizontalVelocity, 0f, deceleration * Time.fixedDeltaTime);
             }
-
-            moveVelocity = Vector2.Lerp(moveVelocity, targetVelocity, acceleration * Time.fixedDeltaTime);
-        
-            rb.linearVelocity = new Vector2(moveVelocity.x, rb.linearVelocity.y);
-        }
-
-        else if (moveInput == Vector2.zero)
-        {
-            moveVelocity = Vector2.Lerp(moveVelocity, Vector2.zero, deceleration * Time.fixedDeltaTime);
-            rb.linearVelocity = new Vector2(moveVelocity.x, rb.linearVelocity.y);
         }
     }
 
@@ -130,12 +199,72 @@ public class PlayerMovement : MonoBehaviour
     }
     #endregion
 
+    #region 着陆/下降
+
+    private void LandCheck()
+    {
+        //着陆状态
+        if((isJumping || isFalling || isWallJumpFalling || isWallJumping || isWallSlideFalling || isWallSliding || isDashFastFalling) && isGrounded && VerticalVelocity <= 0)
+        {
+            ResetJumpValues();
+            StopWallSlide();
+            ResetWallJumpValues();
+            ResetDashes();
+
+            numberOfJumpsUsed = 0;
+
+            VerticalVelocity = Physics2D.gravity.y;
+
+            if(isDashFastFalling && isGrounded)
+            {
+                ResetDashValues();
+                return;
+            }
+
+            ResetDashValues();
+        }
+    }
+
+    private void Fall()
+    {
+        //自然掉落时的重力
+        if(!isGrounded && !isJumping && !isWallSliding && !isWallJumping && !isDashing && !isDashFastFalling)
+        {
+            if(!isFalling)
+            {
+                isFalling = true;
+            }
+
+            VerticalVelocity += moveStats.Gravity * Time.fixedDeltaTime;
+        }
+    }
+
+    #endregion
+
     #region 跳跃
+    private void ResetJumpValues()
+    {
+        isJumping = false;
+        isFalling = false;
+        isFastFalling = false;
+        fastFallTime = 0f;
+        isPastApexThreshold = false;
+    }
+
     private void JumpChecks()
     {
         //如果按下跳跃键
         if(InputManager.JumpWasPressed)
         {
+            if(isWallSlideFalling && wallJumpPostBufferTimer >= 0f)
+            {
+                return;
+            }
+            else if(isWallSliding || (isTouchingWall && !isGrounded))
+            {
+                return;
+            }
+
             jumpBufferTime = moveStats.JumpBufferTime;
             jumpReleasedDuringBuffer = false;
         }
@@ -156,13 +285,13 @@ public class PlayerMovement : MonoBehaviour
                 if(isPastApexThreshold)
                 {
                     isPastApexThreshold = false;
-                    isFastFalliing = true;
+                    isFastFalling = true;
                     fastFallTime = moveStats.TimeForUpwardsCancel;
                     VerticalVelocity = 0f;
                 }
                 else
                 {
-                    isFastFalliing = true;
+                    isFastFalling = true;
                     fastFallReleaseSpeed = VerticalVelocity;
                 }
             }
@@ -176,34 +305,26 @@ public class PlayerMovement : MonoBehaviour
             //如果松开了跳跃键 (小跳)
             if(jumpReleasedDuringBuffer)
             {
-                isFastFalliing = true;
+                isFastFalling = true;
                 fastFallReleaseSpeed = VerticalVelocity;
             }
         }
         //二段跳
-        else if(jumpBufferTime > 0f && isJumping && numberOfJumpsUsed < moveStats.NumberOfJumpsAllowed)
+        else if(jumpBufferTime > 0f && (isJumping || isWallJumping || isWallSlideFalling || isAirDashing || isDashFastFalling) && !isTouchingWall && numberOfJumpsUsed < moveStats.NumberOfJumpsAllowed)
         {
-            isFastFalliing = false;
+            isFastFalling = false;
             InitiateJump(1);
+
+            if(isDashFastFalling)
+            {
+                isDashFastFalling = false;
+            }
         }
         //土狼时间的跳跃
-        else if(jumpBufferTime > 0f && isFalling && numberOfJumpsUsed < moveStats.NumberOfJumpsAllowed - 1)
+        else if(jumpBufferTime > 0f && isFalling && !isWallSlideFalling && numberOfJumpsUsed < moveStats.NumberOfJumpsAllowed - 1)
         {
             InitiateJump(2);
-            isFastFalliing = false;
-        }
-
-        //着陆状态
-        if((isJumping || isFalling) && isGrounded && VerticalVelocity <= 0)
-        {
-            isJumping = false;
-            isFalling = false;
-            isFastFalliing = false;
-            fastFallTime = 0f;
-            isPastApexThreshold = false;
-            numberOfJumpsUsed = 0;
-
-            VerticalVelocity = Physics2D.gravity.y;
+            isFastFalling = false;
         }
     }
 
@@ -217,6 +338,8 @@ public class PlayerMovement : MonoBehaviour
         {
             isJumping = true;
         }
+
+        ResetWallJumpValues();
 
         jumpBufferTime = 0f;
         this.numberOfJumpsUsed += numberOfJumpsUsed;
@@ -232,7 +355,7 @@ public class PlayerMovement : MonoBehaviour
             if(bumpedHead)
             {
                 //触发快速下落
-                isFastFalliing = true;
+                isFastFalling = true;
             }
 
             //上升状态的重力处理
@@ -265,7 +388,7 @@ public class PlayerMovement : MonoBehaviour
                     }
                 }
                 //没有达到顶点的重力处理
-                else
+                else if(!isFastFalling)
                 {
                     VerticalVelocity += moveStats.Gravity * Time.fixedDeltaTime;
                 
@@ -276,7 +399,7 @@ public class PlayerMovement : MonoBehaviour
                 }
             }
             //下降状态的重力处理
-            else if(!isFastFalliing)
+            else if(!isFastFalling)
             {
                 VerticalVelocity += moveStats.Gravity * moveStats.GravityOnReleaseMultiplier * Time.fixedDeltaTime;
             }
@@ -290,7 +413,7 @@ public class PlayerMovement : MonoBehaviour
         }
 
         //处理跳跃中断
-        if(isFastFalliing)
+        if(isFastFalling)
         {
             if(fastFallTime >= moveStats.TimeForUpwardsCancel)
             {
@@ -303,22 +426,279 @@ public class PlayerMovement : MonoBehaviour
 
             fastFallTime += Time.fixedDeltaTime;
         }
+    }
 
-        //自然掉落时的重力
-        if(!isGrounded && !isJumping)
+    #endregion
+
+    #region 墙壁滑行
+    
+    /// <summary>
+    /// 滑墙状态检测逻辑，判断是否进入/退出贴墙下滑
+    /// </summary>
+    private void WallSlideCheck()
+    {
+        // 条件：贴墙、不在地面、不在冲刺状态
+        if (isTouchingWall && !isGrounded && !isDashing)
         {
-            if(!isFalling)
+            // 竖直速度向下，且当前未处于滑墙状态 → 开启滑墙
+            if (VerticalVelocity < 0f && !isWallSliding)
             {
-                isFalling = true;
+                ResetJumpValues();
+                ResetWallJumpValues();
+                ResetDashValues();
+
+                if(moveStats.ResetDashOnWallSlide)
+                {
+                    ResetDashes();
+                }
+
+                isWallSlideFalling = false;
+                isWallSliding = true;
             }
 
-            VerticalVelocity += moveStats.Gravity * Time.fixedDeltaTime;
+            // 配置开启滑墙重置跳跃次数时，清空已使用跳跃计数
+            if (moveStats.ResetJumpsOnWallSlide)
+            {
+                numberOfJumpsUsed = 0;
+            }
+        }
+        // 滑墙中、脱离墙壁、未落地、还未进入滑墙下坠阶段
+        else if (isWallSliding && !isTouchingWall && !isGrounded && !isWallSlideFalling)
+        {
+            // 标记滑墙结束，进入自由下坠
+            isWallSlideFalling = true;
+            StopWallSlide();
+        }
+        // 其他所有情况，直接终止滑墙状态
+        else
+        {
+            StopWallSlide();
+        }
+    }
+
+    /// <summary>
+    /// 终止滑墙状态，重置滑墙标记并消耗一次跳跃额度
+    /// </summary>
+    private void StopWallSlide()
+    {
+        if (isWallSliding)
+        {
+            // 滑墙结束后消耗一次跳跃次数
+            numberOfJumpsUsed++;
+            // 关闭滑墙状态标记
+            isWallSliding = false;
+        }
+    }
+
+    /// <summary>
+    /// 滑墙物理运动逻辑（空白待填充）
+    /// </summary>
+    private void WallSlide()
+    {
+        if(isWallSliding)
+        {
+            VerticalVelocity = Mathf.Lerp(VerticalVelocity, -moveStats.WallSlideSpeed, moveStats.WallSlideDecelerationSpeed * Time.fixedDeltaTime);
+        }
+    }
+
+    #endregion
+
+    #region 蹬墙跳
+
+    private void WallJumpCheck()
+    {
+        // 判断是否需要开启墙跳后置缓冲窗口
+        if (ShouldApplyPostWallJumpBuffer())
+        {
+            // 重置墙跳后置缓冲计时器
+            wallJumpPostBufferTimer = moveStats.WallJumpPostBufferTime;
         }
 
-        //限制最大下落速度
-        VerticalVelocity = Mathf.Clamp(VerticalVelocity, -moveStats.MaxFallSpeed, 50f);
+        // ========== 墙跳松开快速下坠逻辑 ==========
+        // 条件：松开跳跃键、不在滑墙、不贴墙、正处于墙跳上升阶段
+        if (InputManager.JumpWasReleased && !isWallSliding && !isTouchingWall && isWallJumping)
+        {
+            // 当前竖直速度向上（还在上升过程）
+            if (VerticalVelocity > 0f)
+            {
+                // 已经越过墙跳顶点阈值（接近最高点）
+                if (isPastWallJumpApexThreshold)
+                {
+                    isPastWallJumpApexThreshold = false;
+                    isWallJumpFastFalling = true;
+                    wallJumpFastFallTime = moveStats.TimeForUpwardsCancel;
+                    // 直接清零向上速度，立刻下坠
+                    VerticalVelocity = 0f;
+                }
+                else
+                {
+                    // 还没到顶点，开启快速下坠，记录松开瞬间的上升速度
+                    isWallJumpFastFalling = true;
+                    wallJumpFastFallReleaseSpeed = VerticalVelocity;
+                }
+            }
+        }
 
-        rb.linearVelocity = new Vector2(rb.linearVelocity.x, VerticalVelocity);
+        // ========== 墙跳后置缓冲触发墙跳 ==========
+        // 按下跳跃键 且 墙跳后置缓冲计时器仍有剩余时间，执行墙跳
+        if (InputManager.JumpWasPressed && wallJumpPostBufferTimer > 0f)
+        {
+            InitiateWallJump();
+        }
+    }
+
+    private void InitiateWallJump()
+    {
+        if(!isWallJumping)
+        {
+            isWallJumping = true;
+            useWallJumpMoveStats = true;
+        }
+
+        StopWallSlide();
+        ResetJumpValues();
+        wallJumpTime = 0f;
+
+        VerticalVelocity = moveStats.InitialJumpVelocity;
+
+        int dirMultiplier;
+
+        Vector2 hitPoint = lastWallHit.collider.ClosestPoint(bodyCol.bounds.center);
+
+        if(hitPoint.x > transform.position.x)
+        {
+            dirMultiplier = -1;
+        }
+        else
+        {
+            dirMultiplier = 1;
+        }
+
+        horizontalVelocity = Mathf.Abs(moveStats.WallJumpDirection.x) * dirMultiplier;
+    }
+
+    private void WallJump()
+    {
+        if(isWallJumping)
+        {
+            wallJumpTime += Time.deltaTime;
+            if(wallJumpTime >= moveStats.TimeTillJumpApex)
+            {
+                useWallJumpMoveStats = false;
+            }
+
+            if(bumpedHead)
+            {
+                isWallJumpFastFalling = true;
+                useWallJumpMoveStats = false;
+            }
+
+            // 上升阶段重力与顶点滞空控制逻辑
+            if (VerticalVelocity >= 0f)
+            {
+                // 顶点滞空控制
+                // 将当前竖直速度反向映射为0~1区间的顶点进度值，1代表完全到达最高点
+                wallJumpApexPoint = Mathf.InverseLerp(moveStats.WallJumpDirection.y, 0f, VerticalVelocity);
+
+                // 若顶点进度超过阈值，判定进入顶点滞空区间
+                if (wallJumpApexPoint > moveStats.ApexThreshold)
+                {
+                    // 首次进入顶点区间，标记状态并重置滞空计时器
+                    if (!isPastWallJumpApexThreshold)
+                    {
+                        isPastWallJumpApexThreshold = true;
+                        timePastWallJumpApexThreshold = 0f;
+                    }
+
+                    // 已进入顶点区间时，累计滞空计时
+                    if (isPastWallJumpApexThreshold)
+                    {
+                        timePastWallJumpApexThreshold += Time.fixedDeltaTime;
+                        // 滞空时间未达到设定值，锁定竖直速度实现悬浮效果
+                        if (timePastWallJumpApexThreshold < moveStats.ApexHangTime)
+                        {
+                            VerticalVelocity = 0f;
+                        }
+                        // 滞空时长结束，赋予微小向下速度，开始正常下落
+                        else
+                        {
+                            VerticalVelocity = -0.01f;
+                        }
+                    }
+                }
+                else if(!isWallJumpFastFalling)
+                {
+                    VerticalVelocity += moveStats.WallJumpGravity * Time.fixedDeltaTime;
+                    
+                    if(isPastWallJumpApexThreshold)
+                    {
+                        isPastWallJumpApexThreshold = false;
+                    }
+                }
+            }
+            else if(!isWallJumpFastFalling)
+            {
+                VerticalVelocity += moveStats.WallJumpGravity * Time.fixedDeltaTime;
+            }
+            else if(VerticalVelocity < 0f)
+            {
+                if(!isWallJumpFalling)
+                    isWallJumpFalling = true;
+            }
+        }
+
+        if(isWallJumpFastFalling)
+        {
+            if(wallJumpFastFallTime >= moveStats.TimeForUpwardsCancel)
+            {
+                VerticalVelocity += moveStats.WallJumpGravity * moveStats.WallJumpGravityOnReleaseMultiplier * Time.fixedDeltaTime;
+            }
+            else if(wallJumpFastFallTime < moveStats.TimeForUpwardsCancel)
+            {
+                VerticalVelocity = Mathf.Lerp(wallJumpFastFallReleaseSpeed, 0f, (wallJumpFastFallTime / moveStats.TimeForUpwardsCancel));
+            }
+
+            wallJumpFastFallTime += Time.fixedDeltaTime;
+        }
+    }
+
+    private bool ShouldApplyPostWallJumpBuffer()
+    {
+        if(!isGrounded && (isTouchingWall || isWallSliding))
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    private void ResetWallJumpValues()
+    {
+        isWallSlideFalling = false;
+        isWallJumping = false;
+        useWallJumpMoveStats = false;
+        isWallJumpFastFalling = false;
+        isWallJumpFalling = false;
+        isPastWallJumpApexThreshold = false;
+
+        wallJumpFastFallTime = 0f;
+        wallJumpTime = 0f;
+    }
+
+    #endregion
+
+    #region 冲刺
+    private void ResetDashValues()
+    {
+        isDashFastFalling = false;
+        dashOnGroundTimer = -0.01f;
+    }
+
+    private void ResetDashes()
+    {
+        numberOfDashesUsed = 0;
     }
 
     #endregion
@@ -425,10 +805,75 @@ public class PlayerMovement : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// 检测角色左右两侧是否接触墙壁，用于滑墙、墙跳判定
+    /// </summary>
+    private void IsTouchingWall()
+    {
+        // 投射起点X坐标：面朝右取碰撞体最右侧，面朝左取碰撞体最左侧
+        float originEndPoint = 0f;
+        if (isFacingRight)
+        {
+            originEndPoint = bodyCol.bounds.max.x;
+        }
+        else
+        {
+            originEndPoint = bodyCol.bounds.min.x;
+        }
+
+        // 碰撞盒高度：身体碰撞体高度 × 墙壁检测高度缩放系数
+        float adjustedHeight = bodyCol.bounds.size.y * moveStats.WallDetectionRayHeightMultiplier;
+
+        // BoxCast中心点：X为角色左右侧边，Y为身体碰撞体竖直中心
+        Vector2 boxCastOrigin = new Vector2(originEndPoint, bodyCol.bounds.center.y);
+        // 碰撞盒尺寸：宽度=墙壁检测距离，高度=缩放后的身体高度
+        Vector2 boxCastSize = new Vector2(moveStats.WallDetectionRayLength, adjustedHeight);
+
+        // 向角色面朝方向发射盒形投射，检测墙壁层级碰撞
+        wallHit = Physics2D.BoxCast(boxCastOrigin, boxCastSize, 0f, transform.right, moveStats.WallDetectionRayLength, moveStats.GroundLayer);
+        if (wallHit.collider != null)
+        {
+            lastWallHit = wallHit; // 保存本次墙壁碰撞信息
+            isTouchingWall = true; // 标记角色贴墙
+        }
+        else
+        {
+            isTouchingWall = false; // 角色未接触墙壁
+        }
+
+        // 开启墙壁检测框调试绘制
+        if (moveStats.DebugShowWallHitBox)
+        {
+            Color rayColor;
+            // 贴墙显示绿色，未贴墙显示红色
+            if (isTouchingWall)
+            {
+                rayColor = Color.green;
+            }
+            else
+            {
+                rayColor = Color.red;
+            }
+
+            // 计算检测盒四个顶点坐标
+            Vector2 boxBottomLeft = new Vector2(boxCastOrigin.x - boxCastSize.x / 2, boxCastOrigin.y - boxCastSize.y / 2);
+            Vector2 boxBottomRight = new Vector2(boxCastOrigin.x + boxCastSize.x / 2, boxCastOrigin.y - boxCastSize.y / 2);
+            Vector2 boxTopLeft = new Vector2(boxCastOrigin.x - boxCastSize.x / 2, boxCastOrigin.y + boxCastSize.y / 2);
+            Vector2 boxTopRight = new Vector2(boxCastOrigin.x + boxCastSize.x / 2, boxCastOrigin.y + boxCastSize.y / 2);
+
+            // 绘制矩形四条边线，组成完整检测框
+            Debug.DrawLine(boxBottomLeft, boxBottomRight, rayColor);
+            Debug.DrawLine(boxBottomRight, boxTopRight, rayColor);
+            Debug.DrawLine(boxTopRight, boxTopLeft, rayColor);
+            Debug.DrawLine(boxTopLeft, boxBottomLeft, rayColor);
+        }
+    }
+
     private void CollisionChecks()
     {
         IsGrounded();
         BumpedHead();
+        IsTouchingWall();
     }
 
     #endregion
@@ -446,6 +891,11 @@ public class PlayerMovement : MonoBehaviour
         else
         {
             coyoteTimer = moveStats.JumpCoyoteTime;
+        }
+
+        if(!ShouldApplyPostWallJumpBuffer())
+        {
+            wallJumpPostBufferTimer -= Time.deltaTime;
         }
     }
 
